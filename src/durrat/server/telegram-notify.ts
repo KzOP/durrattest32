@@ -17,6 +17,8 @@ type RentPeriod = 'monthly' | 'annual' | 'two_installments';
 
 
 const TELEGRAM_CAPTION_LIMIT = 1024;
+const MAX_TELEGRAM_IMAGES = 39;
+const TELEGRAM_MEDIA_GROUP_LIMIT = 10;
 
 const RENT_CHAT_ID = '@DurratAlHijraRealEstateOffice';
 const SALE_CHAT_ID = '@DurratAlHijraRealEstateOffice11';
@@ -156,8 +158,9 @@ function decodeField(value: FirestoreValue): unknown {
 }
 
 export function listingImageUrls(fields: Record<string, FirestoreValue>) {
-  return propertyImages(Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, decodeField(value)])))
+  const images = propertyImages(Object.fromEntries(Object.entries(fields).map(([key, value]) => [key, decodeField(value)])))
     .filter((url) => isHttpsUrl(url) && !url.includes('durrattest23.vercel.app'));
+  return (images.length ? images : [DEFAULT_IMAGE]).slice(0, MAX_TELEGRAM_IMAGES);
 }
 
 function parseBody(body: unknown): Record<string, unknown> | null {
@@ -196,6 +199,21 @@ function normalizeChatId(value: string) {
   const id = value.trim();
   if (!id) return id;
   return /^(@|-?\d)/.test(id) ? id : `@${id}`;
+}
+
+function splitMediaGroups(images: string[]) {
+  const groups: string[][] = [];
+  let offset = 0;
+  while (offset < images.length) {
+    const remaining = images.length - offset;
+    // Telegram groups must contain 2–10 items; avoid leaving a one-photo group.
+    const size = remaining > TELEGRAM_MEDIA_GROUP_LIMIT && remaining - TELEGRAM_MEDIA_GROUP_LIMIT === 1
+      ? TELEGRAM_MEDIA_GROUP_LIMIT - 1
+      : Math.min(TELEGRAM_MEDIA_GROUP_LIMIT, remaining);
+    groups.push(images.slice(offset, offset + size));
+    offset += size;
+  }
+  return groups;
 }
 
 export function buildMessage(fields: Record<string, FirestoreValue>, propertyId: string, appUrl: string) {
@@ -238,23 +256,36 @@ export function buildMessage(fields: Record<string, FirestoreValue>, propertyId:
 
 export async function deliverListing(botToken: string, chatId: string, images: string[], message: string) {
   const errors: string[] = [];
+  const orderedImages = (images.length ? images : [DEFAULT_IMAGE]).slice(0, MAX_TELEGRAM_IMAGES);
   // Telegram captions allow 1024 parsed characters; preserve the complete template in a follow-up if longer.
   const parsedLength = message.replace(/<[^>]*>/g, '').replace(/&(?:amp|lt|gt|quot|#39);/g, 'x').length;
   const captionFits = parsedLength <= TELEGRAM_CAPTION_LIMIT;
   const caption = captionFits ? message : undefined;
-  if (images.length > 1) {
-    const album = await sendTelegram(botToken, 'sendMediaGroup', {
-      chat_id: chatId,
-      media: images.slice(0, 10).map((media, index) => ({ type: 'photo', media, ...(index === 0 && caption ? { caption, parse_mode: 'HTML' } : {}) })),
-    });
-    if (album.ok && captionFits) return { ok: true, method: 'sendMediaGroup', errors };
-    if (album.ok) {
+  if (orderedImages.length > 1) {
+    let albumFailed = false;
+    const groups = splitMediaGroups(orderedImages);
+    for (const [groupIndex, group] of groups.entries()) {
+      const album = await sendTelegram(botToken, 'sendMediaGroup', {
+        chat_id: chatId,
+        media: group.map((media, index) => ({
+          type: 'photo',
+          media,
+          ...(groupIndex === 0 && index === 0 && caption ? { caption, parse_mode: 'HTML' } : {}),
+        })),
+      });
+      if (!album.ok) {
+        if (album.error) errors.push(album.error);
+        albumFailed = true;
+        break;
+      }
+    }
+    if (!albumFailed && captionFits) return { ok: true, method: 'sendMediaGroup', errors };
+    if (!albumFailed) {
       const text = await sendTelegram(botToken, 'sendMessage', { chat_id: chatId, text: message, parse_mode: 'HTML', disable_web_page_preview: true });
       return { ok: text.ok, method: 'sendMediaGroup', errors: text.error ? [text.error] : errors };
     }
-    if (album.error) errors.push(album.error);
   }
-  const photo = await sendTelegram(botToken, 'sendPhoto', { chat_id: chatId, photo: images[0] || DEFAULT_IMAGE, ...(caption ? { caption, parse_mode: 'HTML' } : {}) });
+  const photo = await sendTelegram(botToken, 'sendPhoto', { chat_id: chatId, photo: orderedImages[0] || DEFAULT_IMAGE, ...(caption ? { caption, parse_mode: 'HTML' } : {}) });
   if (photo.ok && captionFits) return { ok: true, method: 'sendPhoto', errors };
   if (photo.error) errors.push(photo.error);
   const text = await sendTelegram(botToken, 'sendMessage', { chat_id: chatId, text: message, parse_mode: 'HTML', disable_web_page_preview: true });
